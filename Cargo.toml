@@ -1,0 +1,3 @@
+[workspace]
+members = ["voice-core", "voice-gui"]
+resolver = "2"
