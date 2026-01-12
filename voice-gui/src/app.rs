@@ -1,12 +1,12 @@
 use std::hash::Hash;
 
-use iced::advanced::subscription::{from_recipe, EventStream, Hasher, Recipe};
-use iced::futures::stream::BoxStream;
-use iced::futures::StreamExt;
+use iced::advanced::subscription::{EventStream, Hasher, Recipe, from_recipe};
 use iced::alignment::{Horizontal, Vertical};
+use iced::futures::StreamExt;
+use iced::futures::stream::BoxStream;
 use iced::task::Task;
 use iced::widget::image::Handle as ImageHandle;
-use iced::widget::{button, column, container, row, text, text_input, Image};
+use iced::widget::{Image, button, column, container, pick_list, row, text, text_input};
 use iced::{Element, Length, Subscription, Theme};
 use image::ImageFormat;
 use qrcode::{Color, QrCode};
@@ -20,6 +20,9 @@ pub enum Message {
     RemoteTicketChanged(String),
     ToggleListening,
     Call,
+    RefreshDevices,
+    InputDeviceSelected(String),
+    OutputDeviceSelected(String),
     Accept,
     Reject,
     HangUp,
@@ -37,6 +40,10 @@ pub struct VoiceApp {
     muted: bool,
     audio_info: Option<String>,
     qr_handle: Option<ImageHandle>,
+    input_devices: Vec<String>,
+    output_devices: Vec<String>,
+    selected_input: Option<String>,
+    selected_output: Option<String>,
 }
 
 impl VoiceApp {
@@ -78,6 +85,10 @@ impl VoiceApp {
                 muted: false,
                 audio_info: None,
                 qr_handle,
+                input_devices: Vec::new(),
+                output_devices: Vec::new(),
+                selected_input: None,
+                selected_output: None,
             },
             Task::none(),
         )
@@ -104,6 +115,17 @@ impl VoiceApp {
                         ticket: self.remote_ticket.trim().to_string(),
                     });
                 }
+            }
+            Message::RefreshDevices => {
+                self.send_command(CallCommand::RefreshDevices);
+            }
+            Message::InputDeviceSelected(name) => {
+                self.selected_input = Some(name.clone());
+                self.send_command(CallCommand::SetInputDevice(name));
+            }
+            Message::OutputDeviceSelected(name) => {
+                self.selected_output = Some(name.clone());
+                self.send_command(CallCommand::SetOutputDevice(name));
             }
             Message::Accept => {
                 self.send_command(CallCommand::Accept);
@@ -147,6 +169,44 @@ impl VoiceApp {
         ]
         .spacing(10)
         .align_y(Vertical::Center);
+
+        let input_picker: Element<'_, Message> = if self.input_devices.is_empty() {
+            text("No input devices found").size(14).into()
+        } else {
+            pick_list(
+                self.input_devices.clone(),
+                self.selected_input.as_ref(),
+                Message::InputDeviceSelected,
+            )
+            .placeholder("Select input device")
+            .width(Length::Fill)
+            .into()
+        };
+
+        let output_picker: Element<'_, Message> = if self.output_devices.is_empty() {
+            text("No output devices found").size(14).into()
+        } else {
+            pick_list(
+                self.output_devices.clone(),
+                self.selected_output.as_ref(),
+                Message::OutputDeviceSelected,
+            )
+            .placeholder("Select output device")
+            .width(Length::Fill)
+            .into()
+        };
+
+        let device_controls = column![
+            text("Audio devices").size(16),
+            row![text("Input:").size(14), input_picker]
+                .spacing(10)
+                .align_y(Vertical::Center),
+            row![text("Output:").size(14), output_picker]
+                .spacing(10)
+                .align_y(Vertical::Center),
+            button("Refresh devices").on_press(Message::RefreshDevices),
+        ]
+        .spacing(8);
 
         let remote_input = text_input("Paste remote ticket", &self.remote_ticket)
             .on_input(Message::RemoteTicketChanged)
@@ -232,6 +292,7 @@ impl VoiceApp {
         let content = column![
             header,
             ticket_row,
+            device_controls,
             text("Remote ticket:").size(14),
             remote_input,
             actions,
@@ -287,6 +348,17 @@ impl VoiceApp {
                     "Input: {} | Output: {} | {} Hz",
                     info.input_name, info.output_name, info.sample_rate
                 ));
+            }
+            CallEvent::DeviceList {
+                inputs,
+                outputs,
+                selected_input,
+                selected_output,
+            } => {
+                self.input_devices = inputs;
+                self.output_devices = outputs;
+                self.selected_input = selected_input;
+                self.selected_output = selected_output;
             }
         }
     }

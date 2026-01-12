@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -17,6 +17,18 @@ const OPUS_SAMPLE_RATES: [u32; 5] = [48_000, 24_000, 16_000, 12_000, 8_000];
 const FRAME_TIME_MS: u32 = 20;
 const OUTPUT_JITTER_MS: u32 = 120;
 const CHANNELS_MONO: u16 = 1;
+
+#[derive(Clone, Debug, Default)]
+pub struct AudioDeviceSelection {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AudioDeviceList {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioDeviceInfo {
@@ -45,13 +57,13 @@ pub struct AudioPipeline {
 
 impl AudioPipeline {
     pub fn start() -> Result<Self> {
+        Self::start_with_devices(&AudioDeviceSelection::default())
+    }
+
+    pub fn start_with_devices(selection: &AudioDeviceSelection) -> Result<Self> {
         let host = cpal::default_host();
-        let input_device = host
-            .default_input_device()
-            .ok_or_else(|| VoiceError::Audio("No input device available".to_string()))?;
-        let output_device = host
-            .default_output_device()
-            .ok_or_else(|| VoiceError::Audio("No output device available".to_string()))?;
+        let input_device = resolve_input_device(&host, selection.input.as_deref())?;
+        let output_device = resolve_output_device(&host, selection.output.as_deref())?;
 
         let (input_config, input_format) = select_input_stream_config(&input_device)?;
         let (output_config, output_format) = select_output_stream_config(&output_device)?;
@@ -70,21 +82,15 @@ impl AudioPipeline {
         }
 
         let input_name = input_device.name().unwrap_or_else(|_| "Input".to_string());
-        let output_name = output_device.name().unwrap_or_else(|_| "Output".to_string());
+        let output_name = output_device
+            .name()
+            .unwrap_or_else(|_| "Output".to_string());
 
-        let (input_stream, input_consumer) = build_input_stream(
-            &input_device,
-            &input_config,
-            input_format,
-            CHANNELS_MONO,
-        )?;
+        let (input_stream, input_consumer) =
+            build_input_stream(&input_device, &input_config, input_format, CHANNELS_MONO)?;
 
-        let (output_stream, output_producer, output_level) = build_output_stream(
-            &output_device,
-            &output_config,
-            output_format,
-            CHANNELS_MONO,
-        )?;
+        let (output_stream, output_producer, output_level) =
+            build_output_stream(&output_device, &output_config, output_format, CHANNELS_MONO)?;
 
         let frame_size = (sample_rate / (1000 / FRAME_TIME_MS)) as usize;
         let (outgoing_tx, outgoing_rx) = mpsc::channel(128);
@@ -107,13 +113,8 @@ impl AudioPipeline {
         });
 
         let decode_task = tokio::spawn(async move {
-            if let Err(err) = decode_and_play(
-                incoming_rx,
-                output_producer,
-                output_level,
-                sample_rate,
-            )
-            .await
+            if let Err(err) =
+                decode_and_play(incoming_rx, output_producer, output_level, sample_rate).await
             {
                 tracing::error!("audio decode task ended: {err}");
             }
@@ -146,9 +147,9 @@ impl AudioPipeline {
     }
 
     pub fn take_outgoing(&mut self) -> Result<mpsc::Receiver<EncodedFrame>> {
-        self.outgoing_rx
-            .take()
-            .ok_or(VoiceError::InvalidState("Outgoing audio already taken".to_string()))
+        self.outgoing_rx.take().ok_or(VoiceError::InvalidState(
+            "Outgoing audio already taken".to_string(),
+        ))
     }
 
     pub fn incoming_sender(&self) -> mpsc::Sender<EncodedFrame> {
@@ -241,23 +242,33 @@ fn build_input_stream(
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             config,
-            move |data: &[f32], _| push_input_samples(data, channels, target_channels, &mut producer),
+            move |data: &[f32], _| {
+                push_input_samples(data, channels, target_channels, &mut producer)
+            },
             err_fn,
             None,
         ),
         SampleFormat::I16 => device.build_input_stream(
             config,
-            move |data: &[i16], _| push_input_samples(data, channels, target_channels, &mut producer),
+            move |data: &[i16], _| {
+                push_input_samples(data, channels, target_channels, &mut producer)
+            },
             err_fn,
             None,
         ),
         SampleFormat::U16 => device.build_input_stream(
             config,
-            move |data: &[u16], _| push_input_samples(data, channels, target_channels, &mut producer),
+            move |data: &[u16], _| {
+                push_input_samples(data, channels, target_channels, &mut producer)
+            },
             err_fn,
             None,
         ),
-        _ => return Err(VoiceError::Audio("Unsupported input sample format".to_string())),
+        _ => {
+            return Err(VoiceError::Audio(
+                "Unsupported input sample format".to_string(),
+            ));
+        }
     }
     .context("Failed to build input stream")
     .map_err(VoiceError::Other)?;
@@ -270,8 +281,7 @@ fn push_input_samples<T>(
     input_channels: usize,
     target_channels: u16,
     producer: &mut HeapProducer<i16>,
-)
-where
+) where
     T: Sample + ToSample<f32>,
 {
     let target_channels = target_channels as usize;
@@ -318,7 +328,15 @@ fn build_output_stream(
             device.build_output_stream(
                 config,
                 move |data: &mut [f32], _| {
-                    render_output_samples(data, channels, target_channels, &mut consumer, &available, &started, min_samples)
+                    render_output_samples(
+                        data,
+                        channels,
+                        target_channels,
+                        &mut consumer,
+                        &available,
+                        &started,
+                        min_samples,
+                    )
                 },
                 err_fn,
                 None,
@@ -330,7 +348,15 @@ fn build_output_stream(
             device.build_output_stream(
                 config,
                 move |data: &mut [i16], _| {
-                    render_output_samples(data, channels, target_channels, &mut consumer, &available, &started, min_samples)
+                    render_output_samples(
+                        data,
+                        channels,
+                        target_channels,
+                        &mut consumer,
+                        &available,
+                        &started,
+                        min_samples,
+                    )
                 },
                 err_fn,
                 None,
@@ -342,13 +368,25 @@ fn build_output_stream(
             device.build_output_stream(
                 config,
                 move |data: &mut [u16], _| {
-                    render_output_samples(data, channels, target_channels, &mut consumer, &available, &started, min_samples)
+                    render_output_samples(
+                        data,
+                        channels,
+                        target_channels,
+                        &mut consumer,
+                        &available,
+                        &started,
+                        min_samples,
+                    )
                 },
                 err_fn,
                 None,
             )
         }
-        _ => return Err(VoiceError::Audio("Unsupported output sample format".to_string())),
+        _ => {
+            return Err(VoiceError::Audio(
+                "Unsupported output sample format".to_string(),
+            ));
+        }
     }
     .context("Failed to build output stream")
     .map_err(VoiceError::Other)?;
@@ -364,8 +402,7 @@ fn render_output_samples<T>(
     available: &Arc<AtomicUsize>,
     started: &Arc<AtomicBool>,
     min_samples: usize,
-)
-where
+) where
     T: Sample + FromSample<f32>,
 {
     let target_channels = target_channels as usize;
@@ -399,6 +436,84 @@ where
     }
 }
 
+pub fn list_devices() -> Result<AudioDeviceList> {
+    let host = cpal::default_host();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+
+    let input_devices = host
+        .input_devices()
+        .context("Failed to enumerate input devices")
+        .map_err(VoiceError::Other)?;
+    for device in input_devices {
+        if let Ok(name) = device.name() {
+            inputs.push(name);
+        }
+    }
+
+    let output_devices = host
+        .output_devices()
+        .context("Failed to enumerate output devices")
+        .map_err(VoiceError::Other)?;
+    for device in output_devices {
+        if let Ok(name) = device.name() {
+            outputs.push(name);
+        }
+    }
+
+    Ok(AudioDeviceList { inputs, outputs })
+}
+
+pub fn default_device_selection() -> AudioDeviceSelection {
+    let host = cpal::default_host();
+    let input = host
+        .default_input_device()
+        .and_then(|device| device.name().ok());
+    let output = host
+        .default_output_device()
+        .and_then(|device| device.name().ok());
+
+    AudioDeviceSelection { input, output }
+}
+
+fn resolve_input_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(name) = name {
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if device.name().ok().as_deref() == Some(name) {
+                    return Ok(device);
+                }
+            }
+        }
+        tracing::warn!(
+            requested = name,
+            "input device not found, falling back to default"
+        );
+    }
+
+    host.default_input_device()
+        .ok_or_else(|| VoiceError::Audio("No input device available".to_string()))
+}
+
+fn resolve_output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(name) = name {
+        if let Ok(devices) = host.output_devices() {
+            for device in devices {
+                if device.name().ok().as_deref() == Some(name) {
+                    return Ok(device);
+                }
+            }
+        }
+        tracing::warn!(
+            requested = name,
+            "output device not found, falling back to default"
+        );
+    }
+
+    host.default_output_device()
+        .ok_or_else(|| VoiceError::Audio("No output device available".to_string()))
+}
+
 async fn capture_and_encode(
     mut consumer: HeapConsumer<i16>,
     outgoing: mpsc::Sender<EncodedFrame>,
@@ -406,7 +521,8 @@ async fn capture_and_encode(
     sample_rate: u32,
     frame_size: usize,
 ) -> Result<()> {
-    let mut encoder = opus::Encoder::new(sample_rate, opus::Channels::Mono, opus::Application::Voip)?;
+    let mut encoder =
+        opus::Encoder::new(sample_rate, opus::Channels::Mono, opus::Application::Voip)?;
     let mut pcm = vec![0i16; frame_size];
     let mut timestamp: u32 = 0;
 

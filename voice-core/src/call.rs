@@ -1,15 +1,18 @@
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use anyhow::Context;
-use iroh::endpoint::Connection;
 use iroh::Endpoint;
+use iroh::endpoint::Connection;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::audio::{AudioDeviceInfo, AudioPipeline, EncodedFrame};
+use crate::audio::{
+    AudioDeviceInfo, AudioDeviceList, AudioDeviceSelection, AudioPipeline, EncodedFrame,
+    default_device_selection, list_devices,
+};
 use crate::endpoint::{default_config_dir, init_endpoint};
 use crate::error::{Result, VoiceError};
-use crate::ticket::{create_ticket, parse_ticket, CALL_ALPN};
+use crate::ticket::{CALL_ALPN, create_ticket, parse_ticket};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallState {
@@ -26,6 +29,9 @@ pub enum CallCommand {
     StartListening,
     StopListening,
     Dial { ticket: String },
+    RefreshDevices,
+    SetInputDevice(String),
+    SetOutputDevice(String),
     Accept,
     Reject,
     HangUp,
@@ -37,6 +43,12 @@ pub enum CallEvent {
     CallState(CallState),
     Error(String),
     AudioDevices(AudioDeviceInfo),
+    DeviceList {
+        inputs: Vec<String>,
+        outputs: Vec<String>,
+        selected_input: Option<String>,
+        selected_output: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -107,9 +119,7 @@ impl CoreHandle {
             }
         });
 
-        let (node_id, ticket) = init_rx
-            .recv()
-            .map_err(|_| VoiceError::ChannelClosed)??;
+        let (node_id, ticket) = init_rx.recv().map_err(|_| VoiceError::ChannelClosed)??;
 
         Ok(Self {
             command_tx,
@@ -132,6 +142,8 @@ struct CallActor {
     active_call: Option<ActiveCall>,
     mute_handle: Option<Arc<AtomicBool>>,
     internal_tx: Option<mpsc::UnboundedSender<InternalEvent>>,
+    device_list: AudioDeviceList,
+    audio_selection: AudioDeviceSelection,
 }
 
 struct ActiveCall {
@@ -166,6 +178,8 @@ impl CallActor {
             active_call: None,
             mute_handle: None,
             internal_tx: None,
+            device_list: AudioDeviceList::default(),
+            audio_selection: default_device_selection(),
         }
     }
 
@@ -175,6 +189,9 @@ impl CallActor {
         self.internal_tx = Some(internal_tx.clone());
 
         self.emit_state();
+        if let Err(err) = self.refresh_devices() {
+            self.emit_error(err);
+        }
 
         loop {
             tokio::select! {
@@ -227,11 +244,24 @@ impl CallActor {
                     let _ = internal_tx.send(InternalEvent::DialResult(result));
                 });
             }
+            CallCommand::RefreshDevices => {
+                self.refresh_devices()?;
+            }
+            CallCommand::SetInputDevice(name) => {
+                self.audio_selection.input = Some(name);
+                self.emit_device_list();
+            }
+            CallCommand::SetOutputDevice(name) => {
+                self.audio_selection.output = Some(name);
+                self.emit_device_list();
+            }
             CallCommand::Accept => {
                 if let Some(connection) = self.pending_incoming.take() {
                     self.start_call(connection).await?;
                 } else {
-                    return Err(VoiceError::InvalidState("No incoming call to accept".to_string()));
+                    return Err(VoiceError::InvalidState(
+                        "No incoming call to accept".to_string(),
+                    ));
                 }
             }
             CallCommand::Reject => {
@@ -331,13 +361,14 @@ impl CallActor {
         }
         self.listen_task = None;
 
-        let mut audio = AudioPipeline::start()?;
+        let mut audio = AudioPipeline::start_with_devices(&self.audio_selection)?;
         let device_info = audio.device_info();
         let outgoing = audio.take_outgoing()?;
         let incoming = audio.incoming_sender();
         let mute_handle = audio.mute_handle();
 
-        let (mut roq_sender, mut roq_receiver) = roq_transport::AudioTransport::new(connection.clone()).await?;
+        let (mut roq_sender, mut roq_receiver) =
+            roq_transport::AudioTransport::new(connection.clone()).await?;
 
         let sender_internal = self.internal_tx.clone().ok_or(VoiceError::ChannelClosed)?;
         let sender_task = tokio::spawn(async move {
@@ -360,6 +391,9 @@ impl CallActor {
             receiver_task,
         });
         self.mute_handle = Some(mute_handle);
+        self.audio_selection.input = Some(device_info.input_name.clone());
+        self.audio_selection.output = Some(device_info.output_name.clone());
+        self.emit_device_list();
         let _ = self.event_tx.send(CallEvent::AudioDevices(device_info));
         self.set_state(CallState::InCall);
         Ok(())
@@ -397,6 +431,44 @@ impl CallActor {
         let _ = self.event_tx.send(CallEvent::Error(err.to_string()));
         self.state = CallState::Error;
         let _ = self.event_tx.send(CallEvent::CallState(CallState::Error));
+    }
+
+    fn emit_device_list(&self) {
+        let _ = self.event_tx.send(CallEvent::DeviceList {
+            inputs: self.device_list.inputs.clone(),
+            outputs: self.device_list.outputs.clone(),
+            selected_input: self.audio_selection.input.clone(),
+            selected_output: self.audio_selection.output.clone(),
+        });
+    }
+
+    fn refresh_devices(&mut self) -> Result<()> {
+        let devices = list_devices()?;
+        let defaults = default_device_selection();
+
+        let input_valid = self
+            .audio_selection
+            .input
+            .as_ref()
+            .map(|name| devices.inputs.iter().any(|item| item == name))
+            .unwrap_or(false);
+        let output_valid = self
+            .audio_selection
+            .output
+            .as_ref()
+            .map(|name| devices.outputs.iter().any(|item| item == name))
+            .unwrap_or(false);
+
+        if !input_valid {
+            self.audio_selection.input = defaults.input;
+        }
+        if !output_valid {
+            self.audio_selection.output = defaults.output;
+        }
+
+        self.device_list = devices;
+        self.emit_device_list();
+        Ok(())
     }
 }
 
@@ -454,7 +526,10 @@ mod roq_transport {
     }
 
     impl AudioSender {
-        pub async fn send_loop(&mut self, mut outgoing: mpsc::Receiver<EncodedFrame>) -> Result<()> {
+        pub async fn send_loop(
+            &mut self,
+            mut outgoing: mpsc::Receiver<EncodedFrame>,
+        ) -> Result<()> {
             while let Some(frame) = outgoing.recv().await {
                 let packet = RtpPacket {
                     header: Header {
